@@ -97,12 +97,12 @@ public class MonitorActivity extends AbstractProcessor {
             .allowableValues("true", "false")
             .defaultValue("false")
             .build();
-    public static final PropertyDescriptor IGNORED_STARTING_PROCESSOR_TIME = new PropertyDescriptor.Builder()
-            .name("Ignored Starting Processor Time")
+    public static final PropertyDescriptor TRIGGER_INACTIVE_WHEN_START = new PropertyDescriptor.Builder()
+            .name("Trigger Inactive When Start")
             .description("If true, will ignored generate the flowfile in case of inactivity when we start the processor in first time")
-            .required(true)
+            .required(false)
             .allowableValues("true", "false")
-            .defaultValue("false")
+            .defaultValue("true")
             .build();
     public static final PropertyDescriptor ACTIVITY_RESTORED_MESSAGE = new PropertyDescriptor.Builder()
             .name("Activity Restored Message")
@@ -177,7 +177,7 @@ public class MonitorActivity extends AbstractProcessor {
     private final AtomicLong latestSuccessTransfer = new AtomicLong(System.currentTimeMillis());
     private final AtomicLong latestReportedNodeState = new AtomicLong(System.currentTimeMillis());
     private final AtomicBoolean inactive = new AtomicBoolean(false);
-    private final AtomicBoolean firstTimeTriggerWithoutFlowFiles = new AtomicBoolean(true);
+    private final AtomicBoolean hasSuccessTransfer = new AtomicBoolean(false);
     private final AtomicBoolean connectedWhenLastTriggered = new AtomicBoolean(false);
     private final AtomicLong lastInactiveMessage = new AtomicLong(System.currentTimeMillis());
     public static final String STATE_KEY_LATEST_SUCCESS_TRANSFER = "MonitorActivity.latestSuccessTransfer";
@@ -192,7 +192,7 @@ public class MonitorActivity extends AbstractProcessor {
         properties.add(COPY_ATTRIBUTES);
         properties.add(MONITORING_SCOPE);
         properties.add(REPORTING_NODE);
-        properties.add(IGNORED_STARTING_PROCESSOR_TIME);
+        properties.add(TRIGGER_INACTIVE_WHEN_START);
         this.properties = Collections.unmodifiableList(properties);
 
         final Set<Relationship> relationships = new HashSet<>();
@@ -218,6 +218,7 @@ public class MonitorActivity extends AbstractProcessor {
         isClusterScope(context, true);
         resetLastSuccessfulTransfer();
         inactive.set(false);
+        hasSuccessTransfer.set(false);
     }
 
 
@@ -263,7 +264,7 @@ public class MonitorActivity extends AbstractProcessor {
 
         final ComponentLog logger = getLogger();
         final boolean copyAttributes = context.getProperty(COPY_ATTRIBUTES).asBoolean();
-        final boolean isIgnoredStartingProcessorTime = context.getProperty(IGNORED_STARTING_PROCESSOR_TIME).asBoolean();
+        final boolean triggerInactiveWhenStart = context.getProperty(TRIGGER_INACTIVE_WHEN_START).asBoolean();
         final boolean isClusterScope = isClusterScope(context, false);
         final boolean isConnectedToCluster = context.isConnectedToCluster();
         final boolean shouldReportOnlyOnPrimary = shouldReportOnlyOnPrimary(isClusterScope, context);
@@ -287,9 +288,7 @@ public class MonitorActivity extends AbstractProcessor {
 
             boolean sendInactiveMarker = false;
 
-            isInactive = isIgnoredStartingProcessorTime ?
-                    (now >= previousSuccessMillis + thresholdMillis) && !firstTimeTriggerWithoutFlowFiles.get() :
-                    (now >= previousSuccessMillis + thresholdMillis);
+            isInactive = (now >= previousSuccessMillis + thresholdMillis);
             logger.debug("isInactive={}, previousSuccessMillis={}, now={}", new Object[]{isInactive, previousSuccessMillis, now});
             if (isInactive && isClusterScope && isConnectedToCluster) {
                 // Even if this node has been inactive, there may be other nodes handling flow actively.
@@ -312,7 +311,11 @@ public class MonitorActivity extends AbstractProcessor {
 
             if (isInactive) {
                 final boolean continual = context.getProperty(CONTINUALLY_SEND_MESSAGES).asBoolean();
-                sendInactiveMarker = !inactive.getAndSet(true) || (continual && (now > lastInactiveMessage.get() + thresholdMillis));
+                if (!triggerInactiveWhenStart) {
+                    sendInactiveMarker = (!inactive.getAndSet(true) || (continual && (now > lastInactiveMessage.get() + thresholdMillis))) && hasSuccessTransfer.get();
+                } else {
+                    sendInactiveMarker = !inactive.getAndSet(true) || (continual && (now > lastInactiveMessage.get() + thresholdMillis));
+                }
             }
 
             if (sendInactiveMarker && shouldThisNodeReport(isClusterScope, shouldReportOnlyOnPrimary, context)) {
@@ -339,7 +342,7 @@ public class MonitorActivity extends AbstractProcessor {
 
         } else {
             session.transfer(flowFiles, REL_SUCCESS);
-            firstTimeTriggerWithoutFlowFiles.set(false);
+            hasSuccessTransfer.set(true);
             updatedLatestSuccessTransfer = now;
             logger.info("Transferred {} FlowFiles to 'success'", new Object[]{flowFiles.size()});
 
@@ -417,7 +420,6 @@ public class MonitorActivity extends AbstractProcessor {
 
     @OnStopped
     public void onStopped(final ProcessContext context) {
-        firstTimeTriggerWithoutFlowFiles.set(true);
         if (getNodeTypeProvider().isPrimary()) {
             final StateManager stateManager = context.getStateManager();
             try {
